@@ -15,6 +15,10 @@ A lightweight, anti-bot resilient ticket availability monitor built to track sol
 Run with `uv`:
 
 ```bash
+# Optional: Set Telegram alerts (works with both personal chat IDs and group chat IDs)
+export TELEGRAM_BOT_TOKEN="123456789:ABCdef..."
+export TELEGRAM_CHAT_ID="-1001234567890"  # Or comma-separated: "12345,67890"
+
 # Run the monitor loop
 uv run python main.py
 ```
@@ -23,4 +27,5 @@ To run as a background service or in tmux:
 ```bash
 tmux new -s tickets "uv run python main.py"
 ```
+
 
