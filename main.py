@@ -477,15 +477,15 @@ def main():
     targets = [
         "https://www.carnegiehall.org/Calendar/2027/03/18/Das-Rheingold-0600PM",
         "https://www.carnegiehall.org/Calendar/2027/03/19/Die-Walkure-0600PM",
-        # "https://www.carnegiehall.org/Calendar/2027/03/21/Siegfried-0200PM",
-        # "https://www.carnegiehall.org/Calendar/2027/03/23/Gotterdammerung-0600PM",
+        "https://www.carnegiehall.org/Calendar/2027/03/21/Siegfried-0200PM",
+        "https://www.carnegiehall.org/Calendar/2027/03/23/Gotterdammerung-0600PM"
         # "https://www.carnegiehall.org/Calendar/2027/02/28/Vienna-Philharmonic-0200PM"
     ]
 
     engine = MonitorEngine(
         targets=targets,
-        interval_seconds=120,
-        jitter_seconds=10,
+        interval_seconds=150,
+        jitter_seconds=15,
     )
     engine.start_polling()
 
