@@ -9,25 +9,27 @@ Features:
 - Modular architecture with BaseScraper and ScraperRegistry
 """
 
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from datetime import datetime
-from enum import Enum
+import atexit
 import json
 import os
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
 import urllib.request
-from typing import Dict, List, Optional
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from enum import StrEnum
+
 from bs4 import BeautifulSoup
 from curl_cffi import requests
 
 
-class Availability(str, Enum):
+class Availability(StrEnum):
     AVAILABLE = "AVAILABLE"
     UNAVAILABLE = "UNAVAILABLE"
     UNKNOWN = "UNKNOWN"
@@ -39,8 +41,8 @@ class TicketResult:
     availability: Availability
     status_detail: str
     url: str
-    booking_link: Optional[str] = None
-    price_info: Optional[str] = None
+    booking_link: str | None = None
+    price_info: str | None = None
 
 
 class BaseScraper(ABC):
@@ -61,7 +63,7 @@ class BaseScraper(ABC):
 class CarnegieHallScraper(BaseScraper):
     """
     Scraper for Carnegie Hall (carnegiehall.org).
-    
+
     Reverse engineers the client-side BuyButton hydration call:
     1. Fetches concert page once to cache event title and Sitecore item GUID (data-id).
     2. Batches all event GUIDs into a single POST to /api/sitecore/BuyButton/events.
@@ -75,7 +77,7 @@ class CarnegieHallScraper(BaseScraper):
         self.cache_ttl_seconds = cache_ttl_seconds
         self.session = requests.Session(impersonate=self.impersonate)
         # Cache for static metadata {url: (title, data_id, fetched_at_timestamp)}
-        self._meta_cache: Dict[str, tuple[str, str, float]] = {}
+        self._meta_cache: dict[str, tuple[str, str, float]] = {}
 
     def _reset_session(self) -> None:
         """Recycle session to clear any flagged cookies."""
@@ -85,7 +87,7 @@ class CarnegieHallScraper(BaseScraper):
     def can_handle(cls, url: str) -> bool:
         return "carnegiehall.org" in url.lower()
 
-    def _ensure_metadata(self, url: str) -> tuple[str, Optional[str]]:
+    def _ensure_metadata(self, url: str) -> tuple[str, str | None]:
         """
         Fetch event metadata and cache it for 1 hour.
         Once the 1-hour TTL expires, it gracefully re-visits the HTML page,
@@ -99,7 +101,7 @@ class CarnegieHallScraper(BaseScraper):
 
         # Re-fetch page HTML to refresh cookies and confirm metadata
         time.sleep(random.uniform(1.0, 2.5))  # Humanized pacing
-        
+
         # Retry with exponential backoff on transient network timeouts
         resp = None
         for attempt in range(3):
@@ -139,13 +141,13 @@ class CarnegieHallScraper(BaseScraper):
 
         return event_title, data_id
 
-    def check_batch(self, urls: List[str]) -> List[TicketResult]:
+    def check_batch(self, urls: list[str]) -> list[TicketResult]:
         """
         Check all Carnegie Hall URLs in a SINGLE HTTP request!
         This is the most anti-bot resilient approach possible.
         """
-        url_to_id: Dict[str, str] = {}
-        url_to_title: Dict[str, str] = {}
+        url_to_id: dict[str, str] = {}
+        url_to_title: dict[str, str] = {}
         missing_urls = []
 
         for u in urls:
@@ -196,7 +198,7 @@ class CarnegieHallScraper(BaseScraper):
                         for u in urls
                     ]
                 time.sleep(2 * (attempt + 1))
-        
+
         if api_resp.status_code in (403, 429):
             # Session flagged, reset session for next cycle
             self._reset_session()
@@ -298,7 +300,7 @@ class ScraperRegistry:
     """Registry pattern to route any target URL to the right scraper."""
 
     def __init__(self):
-        self._scrapers: List[BaseScraper] = [
+        self._scrapers: list[BaseScraper] = [
             CarnegieHallScraper(),
         ]
 
@@ -312,32 +314,85 @@ class ScraperRegistry:
 class Notifier:
     """Multi-channel notification engine (CLI banner, terminal audio bell, desktop notify-send, Telegram)."""
 
+    _original_bot_name: str | None = None
+
     @staticmethod
-    def send_telegram(message: str) -> None:
+    def _call_telegram_api(method: str, payload: dict) -> dict | None:
         token = os.getenv("TELEGRAM_BOT_TOKEN")
+        if not token:
+            return None
+        url = f"https://api.telegram.org/bot{token}/{method}"
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                raw = resp.read().decode("utf-8")
+                return json.loads(raw)
+        except Exception as e:
+            sys.stderr.write(f"Telegram API {method} error: {e}\n")
+            return None
+
+    @classmethod
+    def send_telegram(cls, message: str) -> None:
         chat_ids = os.getenv("TELEGRAM_CHAT_ID")
-        if not token or not chat_ids:
+        if not chat_ids:
             return
 
         for cid in [c.strip() for c in chat_ids.split(",") if c.strip()]:
-            try:
-                url = f"https://api.telegram.org/bot{token}/sendMessage"
-                payload = {
+            cls._call_telegram_api(
+                "sendMessage",
+                {
                     "chat_id": cid,
                     "text": message,
                     "parse_mode": "HTML",
                     "disable_web_page_preview": False,
-                }
-                # Use standard urllib so telegram notifications never conflict with curl_cffi sessions
-                req = urllib.request.Request(
-                    url,
-                    data=json.dumps(payload).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
-                )
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    pass
-            except Exception as e:
-                sys.stderr.write(f"Failed to send Telegram alert to {cid}: {e}\n")
+                },
+            )
+
+    @classmethod
+    def update_bot_status(cls, is_active: bool, status_note: str = "", count: int = 0) -> None:
+        """
+        Updates the Telegram bot's profile name and description so users can see
+        real-time status (active/stopped/errors) without chat message spam.
+        """
+        token = os.getenv("TELEGRAM_BOT_TOKEN")
+        if not token:
+            return
+
+        # Fetch base name if not cached
+        if cls._original_bot_name is None:
+            me_resp = cls._call_telegram_api("getMyName", {})
+            if me_resp and me_resp.get("ok"):
+                raw_name = me_resp.get("result", {}).get("name", "")
+                # Strip out any previous status indicators
+                clean_name = re.sub(r"\s*\[.*\]\s*$", "", raw_name).strip()
+                cls._original_bot_name = clean_name or "Ticket Monitor"
+            else:
+                cls._original_bot_name = "Ticket Monitor"
+
+        base_name = cls._original_bot_name
+
+        if is_active:
+            badge = " [🟢 Active]"
+            allowed_base = 64 - len(badge)
+            trimmed_base = base_name[:allowed_base] if len(base_name) + len(badge) > 64 else base_name
+            new_name = f"{trimmed_base}{badge}"
+            short_desc = f"🟢 Active | Tracking {count} event(s)\nLast checked: {status_note}"
+        else:
+            badge = " [🔴 Stopped]"
+            allowed_base = 64 - len(badge)
+            trimmed_base = base_name[:allowed_base] if len(base_name) + len(badge) > 64 else base_name
+            new_name = f"{trimmed_base}{badge}"
+            short_desc = f"🔴 Offline: {status_note}" if status_note else "🔴 Monitor is currently offline."
+
+        # Keep short_description under 120 chars
+        short_desc = short_desc[:120]
+
+        cls._call_telegram_api("setMyName", {"name": new_name})
+        cls._call_telegram_api("setMyShortDescription", {"short_description": short_desc})
 
     @classmethod
     def alert_available(cls, result: TicketResult) -> None:
@@ -346,10 +401,7 @@ class Notifier:
 
         banner = "=" * 70
         alert_msg = (
-            f"\n\a{banner}\n"
-            f"🚨🚨🚨 TICKETS NOW AVAILABLE! 🚨🚨🚨\n"
-            f"Event: {result.event_title}\n"
-            f"Direct Booking: {link}\n"
+            f"\n\a{banner}\n🚨🚨🚨 TICKETS NOW AVAILABLE! 🚨🚨🚨\nEvent: {result.event_title}\nDirect Booking: {link}\n"
         )
         if result.price_info:
             alert_msg += f"Price: {result.price_info}\n"
@@ -373,42 +425,32 @@ class Notifier:
 
         # 3. Telegram notification (Group or individual chats)
         tg_html = (
-            f"🚨 <b>TICKETS NOW AVAILABLE!</b>\n\n"
-            f"🎭 <b>Event:</b> <a href=\"{result.url}\">{result.event_title}</a>\n"
+            f'🚨 <b>TICKETS NOW AVAILABLE!</b>\n\n🎭 <b>Event:</b> <a href="{result.url}">{result.event_title}</a>\n'
         )
         if result.price_info:
             tg_html += f"💰 <b>Price:</b> {result.price_info}\n"
-        tg_html += f"🎟️ <b>Direct Booking:</b> <a href=\"{link}\">Click here to buy tickets</a>"
+        tg_html += f'🎟️ <b>Direct Booking:</b> <a href="{link}">Click here to buy tickets</a>'
 
         cls.send_telegram(tg_html)
-
-    @classmethod
-    def notify_startup(cls, initial_results: List[TicketResult], interval_seconds: int, jitter_seconds: int) -> None:
-        """Send a one-time startup message to Telegram confirming the monitor is online and communicating its cadence."""
-        events_list = "\n".join(
-            [f"• <a href=\"{r.url}\">{r.event_title}</a>: {r.status_detail}" for r in initial_results]
-        )
-        msg = (
-            f"🤖 <b>Ticket Monitor Active</b>\n\n"
-            f"<b>Pinging interval:</b> ~{interval_seconds}s (±{jitter_seconds}s jitter)\n\n"
-            f"<b>Monitoring Events:</b>\n{events_list}\n\n"
-            f"<i>You will only be alerted in this channel when tickets become available.</i>"
-        )
-        cls.send_telegram(msg)
 
 
 @dataclass
 class MonitorEngine:
-    targets: List[str]
+    targets: list[str]
     interval_seconds: int = 60
     jitter_seconds: int = 10
+    max_consecutive_errors: int = 5
     registry: ScraperRegistry = field(default_factory=ScraperRegistry)
-    state: Dict[str, Availability] = field(default_factory=dict)
+    state: dict[str, Availability] = field(default_factory=dict)
+    consecutive_errors: int = 0
 
-    def run_once(self) -> List[TicketResult]:
+    def run_once(self) -> list[TicketResult]:
         results = []
+        cycle_has_errors = False
+        error_reasons = []
+
         # Group targets by scraper
-        scraper_groups: Dict[BaseScraper, List[str]] = {}
+        scraper_groups: dict[BaseScraper, list[str]] = {}
         for url in self.targets:
             scraper = self.registry.get_scraper(url)
             scraper_groups.setdefault(scraper, []).append(url)
@@ -422,15 +464,19 @@ class MonitorEngine:
             elapsed = time.perf_counter() - start_t
 
             for result in batch_results:
+                # Check for HTTP 4xx / 5xx or rate limit errors
+                detail = result.status_detail or ""
+                has_http_err = "HTTP 4" in detail or "HTTP 5" in detail
+                if has_http_err or "WAF Rate-limit" in detail or "Network timeout" in detail:
+                    cycle_has_errors = True
+                    error_reasons.append(detail)
+
                 # State transition detection
                 prev_status = self.state.get(result.url)
                 self.state[result.url] = result.availability
 
-                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(
-                    f"[{ts}] [{result.availability.value:11s}] {result.event_title:<30} "
-                    f"({result.status_detail})"
-                )
+                ts = datetime.now(UTC).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+                print(f"[{ts}] [{result.availability.value:11s}] {result.event_title:<30} ({result.status_detail})")
 
                 # Trigger alert ONLY on initial discovery of AVAILABLE or state transition
                 if result.availability == Availability.AVAILABLE and prev_status != Availability.AVAILABLE:
@@ -439,6 +485,20 @@ class MonitorEngine:
                 results.append(result)
 
             print(f"  ↳ Batch checked {len(urls)} target(s) in {elapsed:.2f}s")
+
+        # Circuit breaker error counter management
+        if cycle_has_errors:
+            self.consecutive_errors += 1
+            reason_str = error_reasons[0] if error_reasons else "Errors detected"
+            warn_msg = (
+                f"  ⚠️ Warning: Error cycle encountered "
+                f"({self.consecutive_errors}/{self.max_consecutive_errors}): {reason_str}"
+            )
+            print(warn_msg)
+        else:
+            if self.consecutive_errors > 0:
+                print("  ✅ Recovered from consecutive errors after successful check.")
+            self.consecutive_errors = 0
 
         return results
 
@@ -449,28 +509,63 @@ class MonitorEngine:
         for t in self.targets:
             print(f"  • {t}")
         print(f"Polling interval: ~{self.interval_seconds}s (±{self.jitter_seconds}s jitter)")
+        print(f"Circuit breaker limit: {self.max_consecutive_errors} consecutive failures")
         print("=" * 70 + "\n")
 
-        # First run to establish initial state and confirm responses
-        initial_results = self.run_once()
-        Notifier.notify_startup(
-            initial_results=initial_results,
-            interval_seconds=self.interval_seconds,
-            jitter_seconds=self.jitter_seconds,
-        )
+        shutdown_reason = "Manual stop"
+
+        # Register exit hook to ensure offline status is reflected on any shutdown
+        def _cleanup():
+            try:
+                Notifier.update_bot_status(is_active=False, status_note=shutdown_reason)
+            except Exception:
+                pass
+
+        atexit.register(_cleanup)
+
+        # Handle SIGTERM gracefully
+        def _sigterm_handler(signum, frame):
+            nonlocal shutdown_reason
+            shutdown_reason = "SIGTERM received"
+            sys.exit(0)
+
+        try:
+            signal.signal(signal.SIGTERM, _sigterm_handler)
+        except (ValueError, AttributeError):
+            pass
 
         try:
             while True:
+                self.run_once()
+                now_str = datetime.now(UTC).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+                # Check circuit breaker
+                if self.consecutive_errors >= self.max_consecutive_errors:
+                    shutdown_reason = f"Circuit breaker tripped ({self.consecutive_errors} consecutive errors)"
+                    print(f"\n🚨 CRITICAL: {shutdown_reason}! Stopping scraper to prevent ban.")
+                    break
+
+                # Update bot profile status with latest timestamp
+                Notifier.update_bot_status(
+                    is_active=True,
+                    status_note=now_str,
+                    count=len(self.targets),
+                )
+
                 # Anti-bot jitter: random delay around base interval
                 sleep_time = max(5, self.interval_seconds + random.uniform(-self.jitter_seconds, self.jitter_seconds))
                 time.sleep(sleep_time)
-                try:
-                    self.run_once()
-                except Exception as loop_err:
-                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    sys.stderr.write(f"[{ts}] Transient loop error (recovering): {loop_err}\n")
+
         except KeyboardInterrupt:
+            shutdown_reason = "Stopped by user (Ctrl+C)"
             print("\n👋 Monitor stopped by user.")
+        except Exception as e:
+            shutdown_reason = f"Crashed: {e}"
+            print(f"\n💥 Fatal error: {e}")
+            raise
+        finally:
+            print(f"Updating bot status to offline ({shutdown_reason})...")
+            Notifier.update_bot_status(is_active=False, status_note=shutdown_reason)
 
 
 def main():
@@ -478,7 +573,7 @@ def main():
         "https://www.carnegiehall.org/Calendar/2027/03/18/Das-Rheingold-0600PM",
         "https://www.carnegiehall.org/Calendar/2027/03/19/Die-Walkure-0600PM",
         "https://www.carnegiehall.org/Calendar/2027/03/21/Siegfried-0200PM",
-        "https://www.carnegiehall.org/Calendar/2027/03/23/Gotterdammerung-0600PM"
+        "https://www.carnegiehall.org/Calendar/2027/03/23/Gotterdammerung-0600PM",
         # "https://www.carnegiehall.org/Calendar/2027/02/28/Vienna-Philharmonic-0200PM"
     ]
 
@@ -486,10 +581,10 @@ def main():
         targets=targets,
         interval_seconds=150,
         jitter_seconds=15,
+        max_consecutive_errors=5,
     )
     engine.start_polling()
 
 
 if __name__ == "__main__":
     main()
-
