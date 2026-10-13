@@ -72,6 +72,26 @@ class CarnegieHallScraper(BaseScraper):
 
     BUY_BUTTON_API = "https://www.carnegiehall.org/api/sitecore/BuyButton/events"
 
+    # Known static Sitecore GUIDs for events (bypasses initial HTML scraping if blocked)
+    KNOWN_EVENT_IDS: dict[str, tuple[str, str]] = {
+        "https://www.carnegiehall.org/Calendar/2027/03/18/Das-Rheingold-0600PM": (
+            "Das Rheingold",
+            "{416D7B78-DE0F-4CB7-9299-2B011727EE0D}",
+        ),
+        "https://www.carnegiehall.org/Calendar/2027/03/19/Die-Walkure-0600PM": (
+            "Die Walküre",
+            "{27550908-DF56-4CD4-827F-ED51292570F5}",
+        ),
+        "https://www.carnegiehall.org/Calendar/2027/03/21/Siegfried-0200PM": (
+            "Siegfried",
+            "{E59E1AF0-2D56-4976-841B-BB90261022A1}",
+        ),
+        "https://www.carnegiehall.org/Calendar/2027/03/23/Gotterdammerung-0600PM": (
+            "Götterdämmerung",
+            "{1D661120-16D6-4C88-A4C6-1C08EAC3B6A1}",
+        ),
+    }
+
     def __init__(self, impersonate: str = "chrome", cache_ttl_seconds: int = 3600):
         self.impersonate = impersonate
         self.cache_ttl_seconds = cache_ttl_seconds
@@ -118,6 +138,10 @@ class CarnegieHallScraper(BaseScraper):
             # If cached version exists from before, use it as fallback
             if url in self._meta_cache:
                 return self._meta_cache[url][0], self._meta_cache[url][1]
+            if url in self.KNOWN_EVENT_IDS:
+                title, data_id = self.KNOWN_EVENT_IDS[url]
+                self._meta_cache[url] = (title, data_id, now)
+                return title, data_id
             return url.rstrip("/").split("/")[-1], None
 
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -135,6 +159,9 @@ class CarnegieHallScraper(BaseScraper):
             guid_match = re.search(r'data-id="(\{[A-Fa-f0-9-]+\})"', resp.text)
             if guid_match:
                 data_id = guid_match.group(1)
+
+        if not data_id and url in self.KNOWN_EVENT_IDS:
+            data_id = self.KNOWN_EVENT_IDS[url][1]
 
         if data_id:
             self._meta_cache[url] = (event_title, data_id, now)
@@ -579,8 +606,8 @@ def main():
 
     engine = MonitorEngine(
         targets=targets,
-        interval_seconds=150,
-        jitter_seconds=15,
+        interval_seconds=600,
+        jitter_seconds=20,
         max_consecutive_errors=5,
     )
     engine.start_polling()
