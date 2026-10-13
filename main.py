@@ -606,8 +606,8 @@ def main():
 
     engine = MonitorEngine(
         targets=targets,
-        interval_seconds=150,
-        jitter_seconds=15,
+        interval_seconds=600,
+        jitter_seconds=20,
         max_consecutive_errors=5,
     )
     engine.start_polling()
