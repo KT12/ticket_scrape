@@ -19,6 +19,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -341,7 +342,8 @@ class ScraperRegistry:
 class Notifier:
     """Multi-channel notification engine (CLI banner, terminal audio bell, desktop notify-send, Telegram)."""
 
-    _original_bot_name: str | None = None
+    _last_is_active: bool | None = None
+    _last_desc_update_time: float = 0.0
 
     @staticmethod
     def _call_telegram_api(method: str, payload: dict) -> dict | None:
@@ -358,6 +360,13 @@ class Notifier:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 raw = resp.read().decode("utf-8")
                 return json.loads(raw)
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                retry_after = e.headers.get("Retry-After", "unknown")
+                sys.stderr.write(f"Telegram API {method} rate limited (HTTP 429, retry after {retry_after}s). Skipping.\n")
+                return None
+            sys.stderr.write(f"Telegram API {method} error: {e}\n")
+            return None
         except Exception as e:
             sys.stderr.write(f"Telegram API {method} error: {e}\n")
             return None
@@ -382,44 +391,34 @@ class Notifier:
     @classmethod
     def update_bot_status(cls, is_active: bool, status_note: str = "", count: int = 0) -> None:
         """
-        Updates the Telegram bot's profile name and description so users can see
+        Updates the Telegram bot's short description so users can see
         real-time status (active/stopped/errors) without chat message spam.
+        Throttled to avoid Telegram HTTP 429 rate limits.
         """
         token = os.getenv("TELEGRAM_BOT_TOKEN")
         if not token:
             return
 
-        # Fetch base name if not cached
-        if cls._original_bot_name is None:
-            me_resp = cls._call_telegram_api("getMyName", {})
-            if me_resp and me_resp.get("ok"):
-                raw_name = me_resp.get("result", {}).get("name", "")
-                # Strip out any previous status indicators
-                clean_name = re.sub(r"\s*\[.*\]\s*$", "", raw_name).strip()
-                cls._original_bot_name = clean_name or "Ticket Monitor"
-            else:
-                cls._original_bot_name = "Ticket Monitor"
+        now = time.time()
+        status_changed = cls._last_is_active != is_active
 
-        base_name = cls._original_bot_name
+        # If status hasn't changed and less than 15 minutes have passed, skip to prevent rate limiting
+        if not status_changed and (now - cls._last_desc_update_time < 900):
+            return
 
         if is_active:
-            badge = " [🟢 Active]"
-            allowed_base = 64 - len(badge)
-            trimmed_base = base_name[:allowed_base] if len(base_name) + len(badge) > 64 else base_name
-            new_name = f"{trimmed_base}{badge}"
             short_desc = f"🟢 Active | Tracking {count} event(s)\nLast checked: {status_note}"
         else:
-            badge = " [🔴 Stopped]"
-            allowed_base = 64 - len(badge)
-            trimmed_base = base_name[:allowed_base] if len(base_name) + len(badge) > 64 else base_name
-            new_name = f"{trimmed_base}{badge}"
             short_desc = f"🔴 Offline: {status_note}" if status_note else "🔴 Monitor is currently offline."
 
         # Keep short_description under 120 chars
         short_desc = short_desc[:120]
 
-        cls._call_telegram_api("setMyName", {"name": new_name})
-        cls._call_telegram_api("setMyShortDescription", {"short_description": short_desc})
+        desc_resp = cls._call_telegram_api("setMyShortDescription", {"short_description": short_desc})
+        if desc_resp and desc_resp.get("ok"):
+            cls._last_desc_update_time = now
+
+        cls._last_is_active = is_active
 
     @classmethod
     def alert_available(cls, result: TicketResult) -> None:
