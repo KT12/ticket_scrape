@@ -146,13 +146,19 @@ class CarnegieHallScraper(BaseScraper):
             return url.rstrip("/").split("/")[-1], None
 
         soup = BeautifulSoup(resp.text, "html.parser")
+        event_title = None
         og_title = soup.find("meta", property="og:title")
         if og_title and og_title.get("content"):
             event_title = og_title["content"].strip()
         elif soup.title and soup.title.string:
             event_title = soup.title.string.split("|")[0].strip()
-        else:
-            event_title = url.rstrip("/").split("/")[-1]
+
+        # If redirected to Queue-it or page title is Queue-it / generic, fall back to KNOWN_EVENT_IDS or URL slug
+        if not event_title or "queue-it" in event_title.lower() or "queue" in event_title.lower():
+            if url in self.KNOWN_EVENT_IDS:
+                event_title = self.KNOWN_EVENT_IDS[url][0]
+            else:
+                event_title = url.rstrip("/").split("/")[-1]
 
         buy_container = soup.find(class_=lambda c: c and "js-event-buy" in c)
         data_id = buy_container.get("data-id") if buy_container else None
